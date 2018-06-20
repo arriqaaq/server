@@ -1,4 +1,4 @@
-package
+package server
 
 import (
 	"context"
@@ -6,7 +6,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -25,6 +24,9 @@ func init() {
 	}
 }
 
+func configureServer(s *http.Server, scheme, addr string) {
+}
+
 // NewServer creates a new api server but does not configure it
 func NewServer(handler http.Handler) *Server {
 	s := new(Server)
@@ -34,22 +36,23 @@ func NewServer(handler http.Handler) *Server {
 	return s
 }
 
-// Server for the auction API
+// Options taken from swagger docs
 type Server struct {
 	EnabledListeners []string      //the listeners to enable
 	CleanupTimeout   time.Duration //grace period for which to wait before shutting down the server
 	MaxHeaderSize    int           //controls the maximum number of bytes the server will read parsing the request header's keys and values, including the request line
 
-	SocketPath    os.Fil //the unix socket to listen on" default:"/var/run/server.sock"
+	SocketPath    string //the unix socket to listen on" default:"/var/run/server.sock"
 	domainSocketL net.Listener
 
-	Host         string        //the IP to listen on" default:"localhost" env:"HOST"
-	Port         int           //the port to listen on for insecure connections, defaults to a random value" env:"PORT"
-	ListenLimit  int           //limit the number of outstanding requests"
-	KeepAlive    time.Duration //sets the TCP keep-alive timeouts on accepted connections. It prunes dead TCP connections
-	ReadTimeout  time.Duration //maximum duration before timing out read of the request"
-	WriteTimeout time.Duration //maximum duration before timing out write of the response"
-	httpServerL  net.Listener
+	Host            string        //the IP to listen on" default:"localhost" env:"HOST"
+	Port            int           //the port to listen on for insecure connections, defaults to a random value" env:"PORT"
+	ListenLimit     int           //limit the number of outstanding requests"
+	KeepAlive       time.Duration //sets the TCP keep-alive timeouts on accepted connections. It prunes dead TCP connections
+	ReadTimeout     time.Duration //maximum duration before timing out read of the request"
+	WriteTimeout    time.Duration //maximum duration before timing out write of the response"
+	ShutDownTimeout time.Duration //maximum duration for server to wait to shutdown
+	httpServerL     net.Listener
 
 	Logger       func(string, ...interface{})
 	handler      http.Handler
@@ -169,7 +172,11 @@ func (s *Server) handleShutdown(wg *sync.WaitGroup, server *http.Server) {
 		case <-s.shutdown:
 			log.Println("shutting down server")
 			atomic.AddInt32(&s.shuttingDown, 1)
-			server.Shutdown(context.Background())
+			// Create a context that will expire in 5 seconds and use this as a
+			// timeout to Shutdown.
+			ctx, cancel := context.WithTimeout(context.Background(), s.ShutDownTimeout)
+			defer cancel()
+			server.Shutdown(ctx)
 			s.doneCh <- struct{}{}
 			return
 		}
@@ -189,11 +196,4 @@ func (s *Server) HTTPListener() (net.Listener, error) {
 		}
 	}
 	return s.httpServerL, nil
-}
-
-// As soon as server is initialized but not run yet, this function will be called.
-// If you need to modify a config, store server instance to stop it individually later, this is the place.
-// This function can be called multiple times, depending on the number of serving schemes.
-// scheme value will be set accordingly: "http", "https" or "unix"
-func configureServer(s *http.Server, scheme, addr string) {
 }
