@@ -32,7 +32,7 @@ package main
 
 import (
 	"fmt"
-	glok "github.com/arriqaaq/server"
+	lucio "github.com/arriqaaq/server"
 	"log"
 	"net/http"
 	"os"
@@ -43,7 +43,7 @@ func main() {
 	mux.HandleFunc("/hello", func(w http.ResponseWriter, req *http.Request) {
 		fmt.Fprintf(w, "Hello from %v!\n", os.Getpid())
 	})
-	server := glok.NewServer(mux, "0.0.0.0", 8080)
+	server := lucio.NewServer(mux, "0.0.0.0", 8080)
 	err := server.Serve()
 	log.Println("terminated", os.Getpid(), err)
 }
