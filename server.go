@@ -2,13 +2,16 @@ package server
 
 import (
 	"context"
-	"github.com/arriqaaq/x"
+	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
 	"strconv"
-	"sync"
-	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -28,11 +31,11 @@ func configureServer(s *http.Server, scheme, addr string) {
 }
 
 // NewServer creates a new api server but does not configure it
-func NewServer(handler http.Handler) *Server {
+func NewServer(handler http.Handler, host string, port int) *Server {
 	s := new(Server)
-	s.shutdown = make(chan struct{})
-	s.doneCh = make(chan struct{})
 	s.SetHandler(handler)
+	s.Host = host
+	s.Port = port
 	return s
 }
 
@@ -53,13 +56,11 @@ type Server struct {
 	WriteTimeout    time.Duration //maximum duration before timing out write of the response"
 	ShutDownTimeout time.Duration //maximum duration for server to wait to shutdown
 	httpServerL     net.Listener
+	httpServer      *http.Server
 
 	Logger       func(string, ...interface{})
 	handler      http.Handler
 	hasListeners bool
-	shutdown     chan struct{}
-	doneCh       chan struct{}
-	shuttingDown int32
 }
 
 // Logf logs message either via defined user logger or via system one if no user logger is defined.
@@ -102,8 +103,6 @@ func (s *Server) Serve() (err error) {
 		}
 	}
 
-	var wg sync.WaitGroup
-
 	if s.hasScheme(schemeHTTP) {
 		httpServer := new(http.Server)
 		httpServer.MaxHeaderBytes = int(s.MaxHeaderSize)
@@ -113,21 +112,59 @@ func (s *Server) Serve() (err error) {
 		httpServer.Handler = s.handler
 
 		configureServer(httpServer, "http", s.httpServerL.Addr().String())
-
-		wg.Add(2)
 		s.Logf("Serving at http://%s", s.httpServerL.Addr())
+		s.httpServer = httpServer
+
 		go func(l net.Listener) {
-			defer wg.Done()
-			if err := httpServer.Serve(l); err != nil {
+			if err := s.httpServer.Serve(l); err != nil {
 				s.Fatalf("%v", err)
 			}
 			s.Logf("Stopped serving at http://%s", l.Addr())
 		}(s.httpServerL)
-		go s.handleShutdown(&wg, httpServer)
 	}
 
-	wg.Wait()
-	return nil
+	// Listen to various error signals for shutdown/restart of server
+	signalCh := make(chan os.Signal, 1024)
+	signal.Notify(signalCh, syscall.SIGHUP, syscall.SIGUSR2, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGKILL, os.Interrupt)
+	for {
+		select {
+		case sig := <-signalCh:
+			fmt.Printf("%v signal received.\n", sig)
+			switch sig {
+			case syscall.SIGHUP:
+				// Fork a child process.
+				addr := net.JoinHostPort(s.Host, strconv.Itoa(s.Port))
+				p, err := forkChild(addr, s.httpServerL)
+				if err != nil {
+					fmt.Printf("Unable to fork child: %v.\n", err)
+					continue
+				}
+				fmt.Printf("Forked child %v.\n", p.Pid)
+
+				// Return any errors during shutdown.
+				return s.handleShutdown()
+			case syscall.SIGUSR2:
+				// Fork a child process.
+				addr := net.JoinHostPort(s.Host, strconv.Itoa(s.Port))
+				p, err := forkChild(addr, s.httpServerL)
+				if err != nil {
+					fmt.Printf("Unable to fork child: %v.\n", err)
+					continue
+				}
+
+				// Print the PID of the forked process and keep waiting for more signals.
+				fmt.Printf("Forked child %v.\n", p.Pid)
+			case syscall.SIGINT, syscall.SIGQUIT, syscall.SIGKILL:
+				// Return any errors during shutdown.
+				return s.handleShutdown()
+
+			default:
+				// Return any errors during shutdown.
+				return s.handleShutdown()
+			}
+		}
+	}
+
 }
 
 // Listen creates the listeners for the server
@@ -137,17 +174,16 @@ func (s *Server) Listen() error {
 	}
 
 	if s.hasScheme(schemeHTTP) {
-		listener, err := net.Listen("tcp", net.JoinHostPort(s.Host, strconv.Itoa(s.Port)))
+		addr := net.JoinHostPort(s.Host, strconv.Itoa(s.Port))
+		listener, err := createOrImportListener(addr)
 		if err != nil {
 			return err
 		}
 
-		h, p, err := x.SplitHostPort(listener.Addr().String())
+		_, _, err = SplitHostPort(listener.Addr().String())
 		if err != nil {
 			return err
 		}
-		s.Host = h
-		s.Port = p
 		s.httpServerL = listener
 	}
 
@@ -156,30 +192,13 @@ func (s *Server) Listen() error {
 }
 
 // Shutdown server and clean up resources
-func (s *Server) Shutdown() {
-	if atomic.LoadInt32(&s.shuttingDown) != 0 {
-		s.Logf("already shutting down")
-		return
-	}
-	s.shutdown <- struct{}{}
-	<-s.doneCh
-}
-
-func (s *Server) handleShutdown(wg *sync.WaitGroup, server *http.Server) {
-	defer wg.Done()
-	for {
-		select {
-		case <-s.shutdown:
-			log.Println("shutting down server")
-			atomic.AddInt32(&s.shuttingDown, 1)
-			// Create a context that will expire in 5 seconds and use this as a
-			// timeout to Shutdown.
-			ctx, cancel := context.WithTimeout(context.Background(), s.ShutDownTimeout)
-			defer cancel()
-			server.Shutdown(ctx)
-			s.doneCh <- struct{}{}
-			return
-		}
+func (s *Server) handleShutdown() error {
+	if s.ShutDownTimeout > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), s.ShutDownTimeout)
+		defer cancel()
+		return s.httpServer.Shutdown(ctx)
+	} else {
+		return s.httpServer.Shutdown(context.Background())
 	}
 }
 
@@ -196,4 +215,149 @@ func (s *Server) HTTPListener() (net.Listener, error) {
 		}
 	}
 	return s.httpServerL, nil
+}
+
+type listener struct {
+	Addr     string `json:"addr"`
+	FD       int    `json:"fd"`
+	Filename string `json:"filename"`
+}
+
+func createListener(addr string) (net.Listener, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	return ln, nil
+}
+
+func importListener(addr string) (net.Listener, error) {
+	// Extract the encoded listener metadata from the environment.
+	listenerEnv := os.Getenv("LISTENER")
+	if listenerEnv == "" {
+		return nil, fmt.Errorf("unable to find LISTENER environment variable")
+	}
+
+	// Unmarshal the listener metadata.
+	var l listener
+	err := json.Unmarshal([]byte(listenerEnv), &l)
+	if err != nil {
+		return nil, err
+	}
+	if l.Addr != addr {
+		return nil, fmt.Errorf("unable to find listener for %v", addr)
+	}
+
+	// The file has already been passed to this process, extract the file
+	// descriptor and name from the metadata to rebuild/find the *os.File for
+	// the listener.
+	listenerFile := os.NewFile(uintptr(l.FD), l.Filename)
+	if listenerFile == nil {
+		return nil, fmt.Errorf("unable to create listener file: %v", err)
+	}
+	defer listenerFile.Close()
+
+	// Create a net.Listener from the *os.File.
+	ln, err := net.FileListener(listenerFile)
+	if err != nil {
+		return nil, err
+	}
+	return ln, nil
+}
+
+func createOrImportListener(addr string) (net.Listener, error) {
+	// Try and import a listener for addr. If it's found, use it.
+	ln, err := importListener(addr)
+	if err == nil {
+		fmt.Printf("Imported listener file descriptor for %v.\n", addr)
+		return ln, nil
+	}
+
+	// No listener was imported, that means this process has to create one.
+	ln, err = createListener(addr)
+	if err != nil {
+		return nil, err
+	}
+
+	fmt.Printf("Created listener file descriptor for %v.\n", addr)
+	return ln, nil
+}
+
+func getListenerFile(ln net.Listener) (*os.File, error) {
+	switch t := ln.(type) {
+	case *net.TCPListener:
+		return t.File()
+	case *net.UnixListener:
+		return t.File()
+	}
+	return nil, fmt.Errorf("unsupported listener: %T", ln)
+}
+
+func forkChild(addr string, ln net.Listener) (*os.Process, error) {
+	// Get the file descriptor for the listener and marshal the metadata to pass
+	// to the child in the environment.
+	lnFile, err := getListenerFile(ln)
+	if err != nil {
+		return nil, err
+	}
+	defer lnFile.Close()
+	l := listener{
+		Addr:     addr,
+		FD:       3,
+		Filename: lnFile.Name(),
+	}
+	listenerEnv, err := json.Marshal(l)
+	if err != nil {
+		return nil, err
+	}
+
+	// Pass stdin, stdout, and stderr along with the listener to the child.
+	files := []*os.File{
+		os.Stdin,
+		os.Stdout,
+		os.Stderr,
+		lnFile,
+	}
+
+	// Get current environment and add in the listener to it.
+	environment := append(os.Environ(), "LISTENER="+string(listenerEnv))
+
+	// Get current process name and directory.
+	execName, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	execDir := filepath.Dir(execName)
+
+	// Spawn child process.
+	p, err := os.StartProcess(execName, []string{execName}, &os.ProcAttr{
+		Dir:   execDir,
+		Env:   environment,
+		Files: files,
+		Sys:   &syscall.SysProcAttr{},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return p, nil
+}
+
+// SplitHostPort splits a network address into a host and a port.
+// The port is -1 when there is no port to be found
+func SplitHostPort(addr string) (host string, port int, err error) {
+	h, p, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", -1, err
+	}
+	if p == "" {
+		return "", -1, &net.AddrError{Err: "missing port in address", Addr: addr}
+	}
+
+	pi, err := strconv.Atoi(p)
+	if err != nil {
+		return "", -1, err
+	}
+	return h, pi, nil
 }
