@@ -39,6 +39,7 @@ func NewServer(handler http.Handler, host string, port int) *Server {
 	return s
 }
 
+// Options taken from swagger docs
 type Server struct {
 	EnabledListeners []string      //the listeners to enable
 	CleanupTimeout   time.Duration //grace period for which to wait before shutting down the server
