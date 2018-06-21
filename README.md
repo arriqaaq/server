@@ -7,7 +7,6 @@ Features
 --------
 - Create a simple http server
 - Simple interface. One function `Serve` which handles OS interrupts too, to shut down a server
-- Used in production environments
 
 Installing
 ----------
