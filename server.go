@@ -200,6 +200,11 @@ func (s *Server) handleShutdown() error {
 	}
 }
 
+// Shutdown server and clean up resources
+func (s *Server) Shutdown() error {
+	return s.handleShutdown()
+}
+
 // GetHandler returns a handler useful for testing
 func (s *Server) GetHandler() http.Handler {
 	return s.handler
