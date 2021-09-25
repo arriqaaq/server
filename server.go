@@ -115,7 +115,9 @@ func (s *Server) Serve() (err error) {
 
 		go func(l net.Listener) {
 			if err := s.httpServer.Serve(l); err != nil {
-				s.Fatalf("%v", err)
+				if err != http.ErrServerClosed {
+					s.Fatalf("%v", err)
+				}
 			}
 			s.Logf("Stopped serving at http://%s", l.Addr())
 		}(s.httpServerL)
